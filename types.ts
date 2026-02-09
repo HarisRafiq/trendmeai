@@ -20,6 +20,7 @@ export interface Post {
   gridType: '2x2' | '3x3';
   images: string[]; // Array of Base64 image strings
   groundingUrls?: string[]; // Links to sources found by Gemini
+  sourceArticleId?: string; // Reference to news article this post was created from
 }
 
 export interface GeneratedTrend {
@@ -54,6 +55,19 @@ export interface TrendSignal {
   relevanceScore: number;
   sourceUrl?: string;
   context: string; // Full context for the generator
+}
+
+export interface NewsArticle {
+  id: string;
+  niche: string;
+  headline: string;
+  summary: string; // Brief 100-200 word summary
+  fullContext: string; // Expanded 300-500 word article for reading
+  sourceUrl?: string;
+  relevanceScore: number;
+  fetchedAt: number; // Timestamp when fetched
+  usageCount: number; // How many posts created from this article
+  usedByPosts: { postId: string; userId: string; influencerId: string }[]; // Track which posts used this
 }
 
 export interface GridConfig {
