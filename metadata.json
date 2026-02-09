@@ -1,0 +1,5 @@
+{
+  "name": "TrendMeAI",
+  "description": "An AI Influencer Studio that generates persona-driven content based on real-world events using Gemini Search and Image generation.",
+  "requestFramePermissions": []
+}
