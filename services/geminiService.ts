@@ -799,9 +799,9 @@ export const generateGridImagesFromPrompts = async (prompts: string[], gridType:
             
             const response = await withTimeout(
                 ai.models.generateContent({
-                    model: 'gemini-2.5-flash-image',
+                    model: 'gemini-3-pro-image-preview',
                     contents: { parts: [{ text: combinedPrompt }] },
-                    config: { imageConfig: { aspectRatio: "1:1"  } }
+                    config: { imageConfig: { aspectRatio: "1:1", imageSize: "2K"  } }
                 }),
                 90000, // 90s for image generation
                 'generateGridImagesFromPrompts'
@@ -888,9 +888,9 @@ Generate the grid image now. Photorealistic for photo panels, editorial design f
             
             const response = await withTimeout(
                 ai.models.generateContent({
-                    model: 'gemini-2.5-flash-image',
+                    model: 'gemini-3-pro-image-preview',
                     contents: { parts: [{ text: cinematicPrompt }] },
-                    config: { imageConfig: { aspectRatio: "1:1"  } }
+                    config: { imageConfig: { aspectRatio: "1:1", imageSize: "2K"  } }
                 }),
                 90000, // 90s for complex image generation
                 'generateGridImages'
