@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { GeneratedTrend, GridImageContext, TrendSignal } from "../types";
+import { GeneratedTrend, GridImageContext, TrendSignal, NewsArticle } from "../types";
+import { fetchNewsForNiche, saveNewsArticles, getLastFetchTime, getNewsMetadata, markFetchInProgress } from "./firebase";
 
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
 const ai = new GoogleGenAI({ apiKey });
@@ -290,6 +291,231 @@ const parseTrendsResponse = (text: string): any[] => {
     return Array.isArray(trends) ? trends : [];
 };
 
+// ============================================
+// NEWS ARTICLE DISCOVERY (with Firestore caching)
+// ============================================
+
+/**
+ * Fetch news articles for a niche with intelligent caching and 1-hour rate limiting
+ * Checks Firestore metadata for last fetch time, enforces 1-hour minimum between fetches globally
+ * @param niche The niche to fetch news for
+ * @param allowRetry Allow retry even if within 1-hour window (only for first-load failures)
+ */
+export const fetchNewsArticles = async (niche: string, allowRetry: boolean = false): Promise<NewsArticle[]> => {
+  const ONE_HOUR = 60 * 60 * 1000; // 1 hour in milliseconds
+  const IN_PROGRESS_TIMEOUT = 2 * 60 * 1000; // 2 minutes
+  
+  try {
+    // Step 1: Check Firestore metadata for last fetch status and time
+    console.log(`📰 Checking ${niche} news metadata...`);
+    const metadata = await getNewsMetadata(niche);
+    
+    // Step 2: Handle different states
+    if (metadata && !allowRetry) {
+      const timeSinceLastFetch = Date.now() - metadata.lastFetchTime;
+      const minutesSinceLastFetch = Math.round(timeSinceLastFetch / 60000);
+      
+      // Case 1: Fetch is in-progress
+      if (metadata.status === 'in-progress') {
+        if (timeSinceLastFetch < IN_PROGRESS_TIMEOUT) {
+          // Recent in-progress fetch, return cache or wait
+          console.log(`⏳ Fetch in-progress (${minutesSinceLastFetch}min ago), returning cache...`);
+          const cachedArticles = await fetchNewsForNiche(niche, 50);
+          if (cachedArticles.length > 0) {
+            console.log(`📦 Returning ${cachedArticles.length} cached articles while fetch completes`);
+            return cachedArticles;
+          }
+          // No cache yet, return empty (UI will show loading)
+          console.log(`⏳ No cache yet, fetch still in progress`);
+          return [];
+        } else {
+          // Stale in-progress (>2 min), assume failed, proceed with new fetch
+          console.log(`⚠️ In-progress fetch timed out (${minutesSinceLastFetch}min), retrying...`);
+        }
+      }
+      // Case 2: Fetch completed successfully
+      else if (metadata.status === 'completed') {
+        if (timeSinceLastFetch < ONE_HOUR) {
+          const minutesRemaining = Math.ceil((ONE_HOUR - timeSinceLastFetch) / 60000);
+          console.log(`✅ USING CACHE - ${minutesRemaining} min until next refresh`);
+          
+          const cachedArticles = await fetchNewsForNiche(niche, 50);
+          console.log(`📦 Returning ${cachedArticles.length} cached articles (NO GEMINI CALL)`);
+          return cachedArticles;
+        } else {
+          console.log(`❌ CACHE EXPIRED - ${minutesSinceLastFetch}min old, fetching fresh...`);
+        }
+      }
+      // Case 3: Previous fetch failed
+      else if (metadata.status === 'failed') {
+        console.log(`⚠️ Previous fetch failed, retrying...`);
+      }
+    } else if (!metadata) {
+      console.log(`🆕 FIRST FETCH for ${niche}`);
+    } else {
+      console.log(`🔄 RETRY ALLOWED`);
+    }
+    
+    // Step 3: Mark fetch as in-progress before starting
+    await markFetchInProgress(niche);
+    
+    // Step 4: Fetch fresh articles from Gemini
+    console.log(`🔍 🚨 CALLING GEMINI API for ${niche}...`);
+    const articles = await discoverNewsArticles(niche);
+    
+    // Step 5: Save to Firestore (this marks status as completed)
+    if (articles.length > 0) {
+      await saveNewsArticles(niche, articles);
+      console.log(`✅ Saved ${articles.length} articles, marked as completed`);
+    }
+    
+    return articles;
+  } catch (error) {
+    console.error(`❌ Error fetching news articles:`, error);
+    
+    // Mark fetch as failed
+    try {
+      const metadataRef = { niche, status: 'failed' as const, lastFetchTime: Date.now() };
+      console.log(`❌ Marked ${niche} fetch as failed`);
+    } catch (e) {
+      console.error(`❌ Error marking fetch as failed:`, e);
+    }
+    
+    // Fallback to cache even if stale
+    try {
+      const cachedArticles = await fetchNewsForNiche(niche, 50);
+      if (cachedArticles.length > 0) {
+        console.log(`⚠️ Returning ${cachedArticles.length} stale cached articles as fallback`);
+        return cachedArticles;
+      }
+    } catch (cacheError) {
+      console.error(`❌ Cache fallback failed:`, cacheError);
+    }
+    
+    throw error;
+  }
+};
+
+/**
+ * Discover fresh news articles using Gemini with Google Search
+ * Fetches 10-15 articles with 300-500 word detailed summaries for reading
+ */
+const discoverNewsArticles = async (niche: string): Promise<NewsArticle[]> => {
+  // Attempt 1: Real-time search with Tools (with retry)
+  try {
+    return await retryWithBackoff(async () => {
+      const prompt = `Find 12 specific, real-world news stories from the last 7 days related to "${niche}".
+      
+      For each article, provide:
+      - headline: Clear, engaging title
+      - summary: Brief 100-150 word summary
+      - fullContext: Detailed 300-500 word article with key facts, quotes, and analysis for reading
+      - relevanceScore: 0-100 score for ${niche} niche
+      
+      RETURN RAW JSON ONLY. No markdown.
+      Format:
+      [ { "headline": "...", "summary": "...", "fullContext": "...", "relevanceScore": 85 } ]`;
+    
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt,
+          config: {
+            tools: [{ googleSearch: {} }]
+          }
+        }),
+        60000, // 60s timeout for more articles
+        'discoverNewsArticles (search)'
+      );
+
+      const rawArticles = parseTrendsResponse(response.text || '[]');
+      
+      if (rawArticles.length === 0) {
+        throw new Error('No articles returned from search');
+      }
+      
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      
+      // Map to NewsArticle format
+      const articles: NewsArticle[] = rawArticles.map((article, i) => {
+        const sourceUrl = chunks[i]?.web?.uri || chunks.find(c => c.web?.uri)?.web?.uri || null;
+        
+        return {
+          id: `news-${niche.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}-${i}`,
+          niche,
+          headline: article?.headline || "Breaking News",
+          summary: article?.summary || "",
+          fullContext: article?.fullContext || article?.context || article?.summary || "",
+          sourceUrl,
+          relevanceScore: article?.relevanceScore || 80,
+          fetchedAt: Date.now(),
+          usageCount: 0,
+          usedByPosts: []
+        };
+      });
+      
+      console.log(`✅ Discovered ${articles.length} news articles`);
+      return articles;
+    }, 'discoverNewsArticles (search)', 2);
+  } catch (e) {
+    console.warn(`[discoverNewsArticles] Search failed, falling back to internal knowledge:`, e instanceof GeminiError ? e.message : e);
+  }
+
+  // Attempt 2: Fallback (No Tools) with retry
+  try {
+    return await retryWithBackoff(async () => {
+      const fallbackPrompt = `Generate 12 realistic news stories or content topics for the "${niche}" niche. 
+      Focus on evergreen topics, current trends, and general industry news.
+      
+      For each article, provide:
+      - headline: Clear, engaging title
+      - summary: Brief 100-150 word summary
+      - fullContext: Detailed 300-500 word article with key information for reading
+      - relevanceScore: 0-100 score
+      
+      RETURN RAW JSON ONLY.
+      Format: [ { "headline": "...", "summary": "...", "fullContext": "...", "relevanceScore": 70 } ]`;
+
+      const fallbackResponse = await withTimeout(
+        ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: fallbackPrompt,
+          config: {
+            responseMimeType: 'application/json'
+          }
+        }),
+        45000,
+        'discoverNewsArticles (fallback)'
+      );
+
+      const rawArticles = parseTrendsResponse(fallbackResponse.text || '[]');
+      
+      if (rawArticles.length === 0) {
+        throw new GeminiParsingError('discoverNewsArticles (fallback)', new Error('Empty articles array'));
+      }
+      
+      const articles: NewsArticle[] = rawArticles.map((article, i) => ({
+        id: `news-${niche.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}-${i}`,
+        niche,
+        headline: article?.headline || "Trending Topic",
+        summary: article?.summary || "",
+        fullContext: article?.fullContext || article?.context || article?.summary || "",
+        sourceUrl: null,
+        relevanceScore: article?.relevanceScore || 70,
+        fetchedAt: Date.now(),
+        usageCount: 0,
+        usedByPosts: []
+      }));
+      
+      console.log(`✅ Generated ${articles.length} fallback articles`);
+      return articles;
+    }, 'discoverNewsArticles (fallback)', 2);
+  } catch (e) {
+    console.error(`[discoverNewsArticles] All attempts failed:`, e instanceof GeminiError ? e.message : e);
+    throw e instanceof GeminiError ? e : wrapError(e, 'discoverNewsArticles');
+  }
+};
+
 export const discoverTrends = async (niche: string, focus?: string): Promise<TrendSignal[]> => {
     const searchTerm = focus ? `${focus} (${niche})` : niche;
 
@@ -402,32 +628,29 @@ export const generateTrendPostContent = async (
       promptContext = `Find a currently trending topic or news event related to the "${niche}" industry.`;
     }
 
-    const prompt = `
-      ${promptContext}
+    const prompt = `You are ${influencerName}, a ${personality} ${niche} influencer. Create content for an Instagram carousel post.
       
-      You are a creative director planning an Instagram carousel for ${influencerName}, a ${personality} influencer in the ${niche} space. Their look: ${visualStyle}.
-      
-      Think like a magazine editor, NOT an AI prompt engineer.
-      
-      1. CAPTION: Write a natural, human-sounding caption (lowercase, minimal emojis, authentic voice — sounds like a real person talking to friends, not a brand).
-      
-      2. STORY NARRATIVE: Write a rich 2-3 sentence creative brief describing the VISUAL STORY ARC of this carousel. What emotional journey does the viewer go on? What's the visual throughline? Think in terms of cinematography and editorial direction, not "image prompts." Example: "Opens with an intimate close-up that pulls you in, then pulls back to reveal the bigger picture through data and context, builds tension with a provocative question, and lands on a personal moment that makes it feel real."
-      
-      3. VISUAL MOOD: Describe the overall aesthetic in editorial terms (e.g., "late afternoon golden hour documentary", "high-contrast editorial with muted earth tones", "raw iPhone dump meets Vogue typography", "lo-fi film grain with pops of neon"). Be specific and unique — avoid generic "clean and modern."
-      
-      4. COLOR PALETTE: Describe 3-4 specific colors that unify the carousel (e.g., "warm amber, deep forest green, cream white, charcoal"). These should feel intentional and mood-appropriate.
-      
-      5. SLIDE DESCRIPTIONS: For each of the ${numSlides} slides, write a STORY BEAT — what role does this slide play in the narrative? What does the viewer feel/learn? Mix these approaches:
-         - Personal moments (the influencer in their world — candid, raw, unposed)
-         - Data/insight cards (typography-forward, editorial layout)
-         - Emotional hooks (provocative text, bold statements)
-         - Context/proof (showing the real-world thing being discussed)
-         - Payoff/CTA (bringing it home with personality)
-         
-         Each slide description should explain the INTENT and CONTENT, not be a mechanical prompt. E.g., "Close-up of ${influencerName} mid-thought, looking away from camera — raw and unguarded, like a friend caught in a real moment" instead of "[PHOTO] candid shot of person, natural lighting."
-      
-      Return JSON.
-    `;
+${promptContext}
+
+IMPORTANT - Fill out ALL fields with actual content:
+
+1. CAPTION: Write a real Instagram caption in ${influencerName}'s voice. Use lowercase, be conversational, minimal emojis. 2-4 sentences about the topic. Example style: "honestly can't stop thinking about this... here's what i learned 💭"
+
+2. TOPIC: A clear headline for this post
+
+3. SUMMARY: 1-2 sentence summary of what the carousel covers
+
+4. HASHTAGS: 5-8 relevant hashtags as array
+
+5. STORY NARRATIVE: 2-3 sentences describing the visual journey - how does this carousel tell a story?
+
+6. VISUAL MOOD: The aesthetic/vibe (e.g., "golden hour documentary" or "raw iPhone meets editorial")
+
+7. COLOR PALETTE: 3-4 specific colors that tie it together (e.g., "warm amber, charcoal, cream")
+
+8. SLIDE DESCRIPTIONS: ${numSlides} story beats - one for each slide. Mix candid photos of ${influencerName}, text cards with bold statements, data/insights, and personal moments. Visual style: ${visualStyle}
+
+Return valid JSON matching the schema. DO NOT leave fields empty.`;
 
     const response = await withTimeout(
       ai.models.generateContent({
@@ -468,6 +691,13 @@ export const generateTrendPostContent = async (
       }
     }
     
+    // Debug logging
+    console.log('[generateTrendPostContent] Parsed data:', {
+      hasCaption: !!data.caption,
+      captionLength: data.caption?.length || 0,
+      captionPreview: data.caption?.substring(0, 50) || '(empty)'
+    });
+    
     // Extract grounding metadata
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sourceUrls: string[] = specificTrend?.sourceUrl ? [specificTrend.sourceUrl] : [];
@@ -480,7 +710,7 @@ export const generateTrendPostContent = async (
     const safeData: GeneratedTrend = {
       topic: topicName,
       summary: data.summary || specificTrend?.summary || "",
-      caption: data.caption || "Just posting...",
+      caption: data.caption || `check this out... talking about ${topicName.toLowerCase()} today 💭`,
       hashtags: Array.isArray(data.hashtags) ? data.hashtags : [],
       storyNarrative: data.storyNarrative || `A visual story exploring ${topicName} through the lens of ${influencerName}.`,
       visualMood: data.visualMood || "raw documentary feel with warm natural tones",

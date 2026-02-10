@@ -63,7 +63,7 @@ export interface NewsArticle {
   headline: string;
   summary: string; // Brief 100-200 word summary
   fullContext: string; // Expanded 300-500 word article for reading
-  sourceUrl?: string;
+  sourceUrl?: string | null;
   relevanceScore: number;
   fetchedAt: number; // Timestamp when fetched
   usageCount: number; // How many posts created from this article

@@ -1,14 +1,20 @@
 import React, { useState, useEffect } from "react";
 import toast from "react-hot-toast";
-import { Influencer, Post, TrendSignal, GridImageContext } from "../types";
+import {
+  Influencer,
+  Post,
+  TrendSignal,
+  GridImageContext,
+  NewsArticle,
+} from "../types";
 import {
   generateTrendPostContent,
   generateGridImages,
   GeminiError,
 } from "../services/geminiService";
-import { uploadImages, savePost } from "../services/firebase";
+import { uploadImages, savePost, markArticleUsed } from "../services/firebase";
 import { PostGrid } from "./PostGrid";
-import { WarRoom } from "./WarRoom";
+import { BreakingNewsRoom } from "./BreakingNewsRoom";
 import {
   Sparkles,
   Loader2,
@@ -17,6 +23,7 @@ import {
   Radar,
   AlertCircle,
   RefreshCw,
+  Newspaper,
 } from "lucide-react";
 import {
   savePostGenerationCheckpoint,
@@ -33,7 +40,7 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
   influencer,
   userId,
 }) => {
-  const [activeTab, setActiveTab] = useState<"feed" | "warroom">("warroom");
+  const [activeTab, setActiveTab] = useState<"feed" | "newsroom">("newsroom");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState("");
   const [gridType, setGridType] = useState<"2x2" | "3x3">("2x2");
@@ -175,16 +182,39 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
     }
   };
 
-  const handleCreatePost = async (specificTrend?: TrendSignal) => {
+  const handleCreatePost = async (
+    articleOrTrend?: NewsArticle | TrendSignal,
+  ) => {
     setIsGenerating(true);
     setActiveTab("feed");
     setErrorMsg(null);
+
+    // Determine if we're using a NewsArticle or TrendSignal
+    const isNewsArticle = articleOrTrend && "fullContext" in articleOrTrend;
+    const sourceArticle = isNewsArticle
+      ? (articleOrTrend as NewsArticle)
+      : undefined;
+    const trendSignal = isNewsArticle
+      ? undefined
+      : (articleOrTrend as TrendSignal | undefined);
+
+    // Convert NewsArticle to TrendSignal format for content generation
+    const specificTrend: TrendSignal | undefined = sourceArticle
+      ? {
+          id: sourceArticle.id,
+          headline: sourceArticle.headline,
+          summary: sourceArticle.summary,
+          relevanceScore: sourceArticle.relevanceScore,
+          sourceUrl: sourceArticle.sourceUrl,
+          context: sourceArticle.fullContext,
+        }
+      : trendSignal;
 
     try {
       // Step 1: Generate content
       if (specificTrend) {
         setGenerationStatus(
-          `Analyzing intel: ${specificTrend.headline.substring(0, 30)}...`,
+          `Analyzing: ${specificTrend.headline.substring(0, 30)}...`,
         );
         toast.loading(
           `Analyzing: ${specificTrend.headline.substring(0, 30)}...`,
@@ -270,12 +300,25 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
         gridType: gridType,
         images: imageUrls,
         groundingUrls: trendData.sourceUrls,
+        ...(sourceArticle?.id && { sourceArticleId: sourceArticle.id }), // Only include if exists
       };
 
       setGenerationStatus("Saving post...");
       toast.loading("Publishing post...", { id: "save" });
 
       await savePost(userId, newPost);
+
+      // Mark article as used if it was a news article
+      if (sourceArticle) {
+        await markArticleUsed(
+          sourceArticle.niche,
+          sourceArticle.id,
+          newPost.id,
+          userId,
+          influencer.id,
+        );
+      }
+
       clearPostGenerationCheckpoint(influencer.id);
       toast.success("Post published successfully!", { id: "save" });
     } catch (error) {
@@ -321,16 +364,16 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
           {/* Tab Switcher */}
           <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800">
             <button
-              onClick={() => setActiveTab("warroom")}
+              onClick={() => setActiveTab("newsroom")}
               className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2.5 rounded-md text-sm font-medium transition-all min-h-[44px] ${
-                activeTab === "warroom"
-                  ? "bg-slate-800 text-emerald-400 shadow-sm"
+                activeTab === "newsroom"
+                  ? "bg-slate-800 text-blue-400 shadow-sm"
                   : "text-slate-500 hover:text-slate-300"
               }`}
             >
               <Radar size={16} />
-              <span className="hidden xs:inline">War Room</span>
-              <span className="xs:hidden">Intel</span>
+              <span className="hidden xs:inline">Breaking News</span>
+              <span className="xs:hidden">News</span>
             </button>
             <button
               onClick={() => setActiveTab("feed")}
@@ -422,23 +465,24 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
 
       {/* Content Area */}
       <div className="flex-1 overflow-y-auto relative">
-        {activeTab === "warroom" ? (
-          <WarRoom
+        {activeTab === "newsroom" ? (
+          <BreakingNewsRoom
             niche={influencer.niche}
-            onSelectTrend={handleCreatePost}
+            userId={userId}
+            onCreatePost={handleCreatePost}
             isProcessing={isGenerating}
           />
         ) : (
           <div className="p-4 sm:p-6 md:p-8 max-w-5xl mx-auto">
             {influencer.posts.length === 0 ? (
               <div className="text-center py-12 sm:py-20 text-slate-500">
-                <Radar className="w-12 h-12 sm:w-16 sm:h-16 mx-auto mb-4 opacity-20 text-emerald-500" />
+                <Radar className="w-12 h-12 sm:w-16 sm:h-16 mx-auto mb-4 opacity-20 text-blue-500" />
                 <h3 className="text-base sm:text-lg font-medium text-slate-400 mb-2">
                   Feed Empty
                 </h3>
                 <p className="text-sm px-4">
-                  Go to the <strong>War Room</strong> to scan for intel and
-                  deploy content.
+                  Go to the <strong>Breaking News</strong> room to browse
+                  articles and create content.
                 </p>
               </div>
             ) : (
@@ -494,6 +538,17 @@ export const InfluencerFeed: React.FC<InfluencerFeedProps> = ({
                           </span>
                         ))}
                       </div>
+
+                      {post.sourceArticleId && (
+                        <div className="mt-2 sm:mt-3 pt-2 sm:pt-3 border-t border-slate-800 pl-9 sm:pl-11">
+                          <div className="flex items-center gap-2 text-[10px] sm:text-xs text-blue-500">
+                            <Newspaper size={12} />
+                            <span className="font-mono uppercase">
+                              Created from Breaking News Article
+                            </span>
+                          </div>
+                        </div>
+                      )}
 
                       {post.groundingUrls && post.groundingUrls.length > 0 && (
                         <div className="mt-3 sm:mt-4 pt-2 sm:pt-3 border-t border-slate-800 pl-9 sm:pl-11">

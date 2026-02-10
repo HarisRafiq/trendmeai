@@ -1,9 +1,9 @@
 /// <reference types="vite/client" />
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut as firebaseSignOut, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, query, where, orderBy, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, query, where, orderBy, deleteDoc, getDocs, getDoc, writeBatch, Timestamp, limit } from 'firebase/firestore';
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { Influencer, Post } from '../types';
+import { Influencer, Post, NewsArticle } from '../types';
 
 // Replace these with your actual Firebase config or ensure they are in your environment variables
 const firebaseConfig = {
@@ -217,6 +217,224 @@ export const deletePost = async (userId: string, postId: string) => {
     console.log(`✅ Deleted post: ${postId}`);
   } catch (error) {
     console.error("❌ Error deleting post:", error);
+    throw error;
+  }
+};
+
+// ============================================
+// NEWS ARTICLE FUNCTIONS
+// ============================================
+
+/**
+ * Get the metadata for a specific niche including status and timestamps
+ * Returns null if niche has never been fetched
+ */
+export const getNewsMetadata = async (niche: string): Promise<{
+  lastFetchTime: number;
+  status: 'in-progress' | 'completed' | 'failed';
+  articleCount: number;
+} | null> => {
+  try {
+    const metadataRef = doc(db, 'newsArticles', niche, 'metadata', 'lastFetch');
+    const snapshot = await getDoc(metadataRef);
+    
+    if (!snapshot.exists()) {
+      console.log(`📭 No metadata found for ${niche}`);
+      return null;
+    }
+    
+    const data = snapshot.data();
+    const lastFetchTime = data?.lastFetchTime || Date.now();
+    const status = data?.status || 'completed';
+    const articleCount = data?.articleCount || 0;
+    
+    const minutesAgo = Math.round((Date.now() - lastFetchTime) / 60000);
+    console.log(`📅 ${niche} metadata: status=${status}, ${minutesAgo}min ago, ${articleCount} articles`);
+    
+    return { lastFetchTime, status, articleCount };
+  } catch (error) {
+    console.error("❌ Error fetching metadata:", error);
+    return null;
+  }
+};
+
+/**
+ * Get the last fetch time for a specific niche from metadata document
+ * Returns null if niche has never been fetched
+ */
+export const getLastFetchTime = async (niche: string): Promise<number | null> => {
+  const metadata = await getNewsMetadata(niche);
+  return metadata?.lastFetchTime || null;
+};
+
+/**
+ * Fetch news articles for a specific niche from the top-level newsArticles collection
+ * Articles are shared across all users for efficient caching
+ */
+export const fetchNewsForNiche = async (niche: string, maxResults: number = 50): Promise<NewsArticle[]> => {
+  try {
+    console.log(`📰 Fetching news for niche: ${niche}`);
+    
+    // Query top-level collection: newsArticles/{niche}/articles
+    const q = query(
+      collection(db, 'newsArticles', niche, 'articles'),
+      orderBy('fetchedAt', 'desc'),
+      limit(maxResults)
+    );
+    
+    const snapshot = await getDocs(q);
+    const articles = snapshot.docs.map(doc => doc.data() as NewsArticle);
+    
+    console.log(`✅ Fetched ${articles.length} articles for ${niche}`);
+    return articles;
+  } catch (error) {
+    console.error("❌ Error fetching news articles:", error);
+    return [];
+  }
+};
+
+/**
+ * Mark a niche fetch as in-progress
+ * Call this before starting a fetch to prevent duplicate requests
+ */
+export const markFetchInProgress = async (niche: string) => {
+  try {
+    const metadataRef = doc(db, 'newsArticles', niche, 'metadata', 'lastFetch');
+    await setDoc(metadataRef, {
+      niche,
+      status: 'in-progress',
+      lastFetchTime: Date.now(),
+      lastUpdated: Date.now()
+    }, { merge: true });
+    console.log(`🔄 Marked ${niche} fetch as in-progress`);
+  } catch (error) {
+    console.error("❌ Error marking fetch in-progress:", error);
+  }
+};
+
+/**
+ * Save multiple news articles to Firestore
+ * Uses merge to avoid overwriting existing usage data
+ * Also updates metadata document with lastFetchTime and completed status
+ */
+export const saveNewsArticles = async (niche: string, articles: NewsArticle[]) => {
+  try {
+    console.log(`💾 Saving ${articles.length} news articles for ${niche}...`);
+    
+    const batch = writeBatch(db);
+    
+    // Save all articles
+    for (const article of articles) {
+      const ref = doc(db, 'newsArticles', niche, 'articles', article.id);
+      // Use merge to preserve existing usageCount and usedByPosts if they exist
+      batch.set(ref, article, { merge: true });
+    }
+    
+    // Update metadata document with fetch timestamp and completed status
+    const metadataRef = doc(db, 'newsArticles', niche, 'metadata', 'lastFetch');
+    batch.set(metadataRef, {
+      niche,
+      lastFetchTime: Date.now(),
+      status: 'completed',
+      articleCount: articles.length,
+      lastUpdated: Date.now()
+    }, { merge: true });
+    
+    await batch.commit();
+    console.log(`✅ Successfully saved ${articles.length} articles and marked as completed`);
+  } catch (error) {
+    console.error("❌ Error saving news articles:", error);
+    throw error;
+  }
+};
+
+/**
+ * Mark a news article as used by creating a post reference
+ * Updates usageCount and adds to usedByPosts array
+ */
+export const markArticleUsed = async (
+  niche: string,
+  articleId: string,
+  postId: string,
+  userId: string,
+  influencerId: string
+) => {
+  try {
+    console.log(`📍 Marking article ${articleId} as used by post ${postId}`);
+    
+    const ref = doc(db, 'newsArticles', niche, 'articles', articleId);
+    
+    // Fetch current article to update arrays
+    const snapshot = await getDocs(query(collection(db, 'newsArticles', niche, 'articles'), where('__name__', '==', articleId)));
+    
+    if (snapshot.empty) {
+      console.warn(`⚠️ Article ${articleId} not found`);
+      return;
+    }
+    
+    const currentData = snapshot.docs[0].data() as NewsArticle;
+    const updatedUsedByPosts = [
+      ...(currentData.usedByPosts || []),
+      { postId, userId, influencerId }
+    ];
+    
+    await setDoc(ref, {
+      usageCount: (currentData.usageCount || 0) + 1,
+      usedByPosts: updatedUsedByPosts
+    }, { merge: true });
+    
+    console.log(`✅ Updated article usage tracking`);
+  } catch (error) {
+    console.error("❌ Error marking article as used:", error);
+    throw error;
+  }
+};
+
+/**
+ * Check if a user has already created a post from a specific article
+ */
+export const checkUserUsedArticle = async (
+  niche: string,
+  articleId: string,
+  userId: string
+): Promise<boolean> => {
+  try {
+    const q = query(
+      collection(db, 'newsArticles', niche, 'articles'),
+      where('__name__', '==', articleId)
+    );
+    
+    const snapshot = await getDocs(q);
+    
+    if (snapshot.empty) return false;
+    
+    const article = snapshot.docs[0].data() as NewsArticle;
+    const usedByPosts = article.usedByPosts || [];
+    
+    return usedByPosts.some(usage => usage.userId === userId);
+  } catch (error) {
+    console.error("❌ Error checking article usage:", error);
+    return false;
+  }
+};
+
+/**
+ * Clean up old news articles (older than specified days)
+ * Runs as a batch delete operation
+ */
+export const cleanupOldNews = async (olderThanDays: number = 7) => {
+  try {
+    console.log(`🧹 Cleaning up news articles older than ${olderThanDays} days...`);
+    
+    const cutoffTime = Date.now() - (olderThanDays * 24 * 60 * 60 * 1000);
+    
+    // Note: In a production app, you'd want to query all niches
+    // For now, this is a manual cleanup function that needs niche specified
+    // Consider using Firebase Cloud Functions for automated cleanup
+    
+    console.log(`ℹ️ Cleanup requires niche parameter - implement via Cloud Function for automation`);
+  } catch (error) {
+    console.error("❌ Error cleaning up old news:", error);
     throw error;
   }
 };
